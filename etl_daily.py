@@ -12,6 +12,8 @@ Incluye los siguientes pipelines ya probados por el usuario (codes 1..6), unific
   5) http_summary_browsers
   6) quality_speed_{summary,histogram,top_locations}  [con limit=50 + fallbacks en top/locations]
 
++ 7) attacks_l3_top_origin_locations (NUEVO)  ← integración solicitada
+
 Ejecuta TODO de forma diaria (últimas 24h) sin CLI. Programable en Windows Task Scheduler.
 """
 
@@ -1548,6 +1550,218 @@ def run_quality_speed_all(days=1, which="all"):
 
 
 # ====================================================================
+# 7) CODE 7: attacks_l3_top_origin_locations (NUEVO)
+# ====================================================================
+
+TABLE_L3_TOP_ORIGIN = "attacks_l3_top_origin_locations"
+EP_L3_TOP_ORIGIN = "/attacks/layer3/top/locations/origin"
+
+def fetch_attacks_l3_top_origin(date_range: str = "30d", limit_requested: int = 100) -> dict | None:
+    """
+    Llama a /radar/attacks/layer3/top/locations/origin
+    Devuelve el envelope completo (success, result={meta, top_0}, ...).
+    """
+    url = f"{API_BASE_RADAR}{EP_L3_TOP_ORIGIN}"
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Accept": "application/json"}
+    params = {"dateRange": date_range, "limit": limit_requested, "format": "json"}
+    print(f"-> GET {url}  params={params}")
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=60)
+        if not r.ok:
+            print(f"❌ HTTP {r.status_code}: {r.text[:400]}")
+            r.raise_for_status()
+        data = r.json()
+        if "result" not in data:
+            raise ValueError("Respuesta sin 'result'")
+        return data
+    except Exception as e:
+        print(f"❌ Error fetch L3 top origin: {e}")
+        return None
+
+def _meta_fields_l3_origin(result: dict):
+    """ Extrae ventana, unidad, confidence y last_updated del envelope result. """
+    meta = result.get("meta", {}) or {}
+    window_start = window_end = last_updated = None
+    unit = None
+    confidence_level = None
+    try:
+        dr = meta.get("dateRange", [])
+        if dr and isinstance(dr, list) and isinstance(dr[0], dict):
+            window_start = _to_dt_utc(dr[0].get("startTime"))
+            window_end   = _to_dt_utc(dr[0].get("endTime"))
+    except: pass
+    try:
+        units = meta.get("units", [])
+        if units and isinstance(units, list) and isinstance(units[0], dict):
+            unit = units[0].get("value")
+    except: pass
+    try:
+        confidence_level = meta.get("confidenceInfo", {}).get("level")
+    except: pass
+    try:
+        last_updated = _to_dt_utc(meta.get("lastUpdated"))
+    except: pass
+    return window_start, window_end, unit, confidence_level, last_updated
+
+def _best_location_fields_origin(item: dict, default_type: str = "country"):
+    """
+    Tolerante a claves del endpoint ORIGIN:
+    - originCountryAlpha2 / originCountryName
+    - location: { type, code/id/alpha2..., name/label/countryName }
+    - clientCountryAlpha2 / clientCountryName / code / key...
+    """
+    loc_type = default_type
+    loc_id = item.get("originCountryAlpha2")
+    loc_name = item.get("originCountryName")
+
+    loc = item.get("location")
+    if (not loc_id or not loc_name) and isinstance(loc, dict):
+        loc_type = loc.get("type") or default_type
+        loc_id = loc_id or (
+            loc.get("code") or loc.get("id") or loc.get("alpha2") or
+            loc.get("alpha_2") or loc.get("iso2") or loc.get("cca2")
+        )
+        loc_name = loc_name or (loc.get("name") or loc.get("label") or loc.get("countryName"))
+
+    if not loc_id:
+        loc_id = (item.get("clientCountryAlpha2") or item.get("alpha2") or
+                  item.get("key") or item.get("code") or item.get("id"))
+    if not loc_name:
+        loc_name = (item.get("clientCountryName") or item.get("name") or item.get("label"))
+
+    if not loc_type:
+        loc_type = default_type
+    if not loc_id:
+        loc_id = "UNKNOWN"
+    return loc_type, str(loc_id).upper(), loc_name
+
+def transform_l3_top_origin(payload: dict, limit_requested: int) -> pd.DataFrame:
+    """
+    Transforma { result: { meta, top_0 } } en DataFrame listo para upsert.
+    """
+    if not payload or "result" not in payload:
+        return pd.DataFrame()
+
+    result = payload["result"]
+    window_start, window_end, unit, confidence_level, last_updated = _meta_fields_l3_origin(result)
+    if window_start is None or window_end is None:
+        print("⚠️ Meta.dateRange no disponible; se omiten filas.")
+        return pd.DataFrame()
+
+    items = result.get("top_0") or result.get("top") or []
+    rows = []
+    now_utc = _now_utc()
+
+    for idx, it in enumerate(items, start=1):
+        raw_val = it.get("value")
+        try:
+            value = float(raw_val)
+        except:
+            value = 0.0
+
+        rnk = it.get("rank")
+        try:
+            rank = int(rnk) if rnk is not None else idx
+        except:
+            rank = idx
+
+        loc_type, loc_id, loc_name = _best_location_fields_origin(it)
+
+        rows.append({
+            "window_start":        window_start,
+            "window_end":          window_end,
+            "location_type":       loc_type,
+            "location_id":         loc_id,
+            "location_name":       loc_name,
+            "value":               value,
+            "rank":                rank,
+            "unit":                unit,
+            "limit_requested":     limit_requested,
+            "confidence_level":    confidence_level,
+            "last_updated":        last_updated,
+            "source_json":         payload,
+            "ingestion_timestamp": now_utc
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["window_start"] = pd.to_datetime(df["window_start"], utc=True)
+        df["window_end"]   = pd.to_datetime(df["window_end"],   utc=True)
+        df.sort_values(["window_start","window_end","rank"], inplace=True)
+        df.reset_index(drop=True, inplace=True)
+    print(f"✔️ Transformación L3 top origin: {len(df)} filas")
+    return df
+
+def upsert_l3_top_origin_df(df: pd.DataFrame, table_name: str, conflict_cols: list[str]):
+    """
+    Inserta con JSONB y ON CONFLICT DO NOTHING (mismo patrón que netflows).
+    """
+    if df.empty:
+        print(f"⚠️ No hay datos para cargar en {table_name}.")
+        return
+    cols = list(df.columns)
+    colnames_sql = ",".join(cols)
+    placeholders = "(" + ",".join(["%s"] * len(cols)) + ")"
+    rows = []
+    for _, r in df.iterrows():
+        row = []
+        for c in cols:
+            v = r[c]
+            if c == "source_json":
+                if isinstance(v, str):
+                    try:
+                        v = json.loads(v)
+                    except Exception:
+                        v = {"raw": v}
+                v = pg_extras.Json(v)
+            else:
+                try:
+                    if pd.isna(v):
+                        v = None
+                except Exception:
+                    pass
+                if isinstance(v, pd.Timestamp):
+                    v = None if pd.isna(v) else v.to_pydatetime()
+            row.append(v)
+        rows.append(tuple(row))
+
+    conn = None
+    try:
+        conn = _pg_conn()
+        cur = conn.cursor()
+        values_block = ",".join(cur.mogrify(placeholders, tup).decode("utf-8") for tup in rows)
+        conflict_sql = ", ".join(conflict_cols)
+        insert_sql = f"""
+            INSERT INTO {table_name} ({colnames_sql})
+            VALUES {values_block}
+            ON CONFLICT ({conflict_sql}) DO NOTHING;
+        """
+        cur.execute(insert_sql)
+        conn.commit()
+        print(f"✅ Carga OK: {cur.rowcount} filas nuevas en '{table_name}'.")
+    except Exception as e:
+        print(f"❌ Error al cargar en {table_name}: {e}")
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+def run_attacks_l3_top_origin(date_range: str = "30d", limit: int = 100):
+    print(f"=== L3 Top Origin (dateRange={date_range}, limit={limit}) ===")
+    payload = fetch_attacks_l3_top_origin(date_range=date_range, limit_requested=limit)
+    df = transform_l3_top_origin(payload, limit_requested=limit)
+    if not df.empty:
+        upsert_l3_top_origin_df(
+            df,
+            TABLE_L3_TOP_ORIGIN,
+            conflict_cols=["window_start", "window_end", "location_type", "location_id"]
+        )
+    print("=== L3 Top Origin Finalizado ===")
+
+
+# ====================================================================
 # ORQUESTADOR DIARIO (sin CLI)
 # ====================================================================
 
@@ -1564,6 +1778,9 @@ def run_daily_default():
 
     # 3) L3 summaries (último día)
     run_attacks_l3_summaries(date_range="1d")
+
+    # 3B) NUEVO: Top países ORIGEN de ataques L3 (foto 30d, top 100)
+    run_attacks_l3_top_origin(date_range="30d", limit=100)
 
     # 4) Netflows Top Locations (último día, product ALL, top 100)
     run_netflows_top_locations(date_range="1d", product="ALL", location_type="country", limit=100)
