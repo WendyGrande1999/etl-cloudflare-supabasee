@@ -10,7 +10,7 @@ Incluye los siguientes pipelines ya probados por el usuario (codes 1..6), unific
   3) attacks_l3_summary_protocol + attacks_l3_summary_ip_version
   4) netflows_top_locations
   5) http_summary_browsers
-  6) quality_speed_{summary,histogram,top_locations}  [con limit=50 + fallbacks en top/locations]
+  6) quality_speed_{summary,histogram}  [con limit=50 eliminado para top/locations]
 
 + 7) attacks_l3_top_origin_locations (NUEVO)  ← integración solicitada
 
@@ -1177,16 +1177,14 @@ def run_http_summary_browsers(days=1):
 
 
 # ====================================================================
-# 6) CODE 6: quality/speed (con los microajustes solicitados)
+# 6) CODE 6: quality/speed (summary + histogram)  [top_locations removido]
 # ====================================================================
 
-TBL_QS_SUMMARY       = "quality_speed_summary"
-TBL_QS_HISTOGRAM     = "quality_speed_histogram"
-TBL_QS_TOP_LOCATIONS = "quality_speed_top_locations"
+TBL_QS_SUMMARY   = "quality_speed_summary"
+TBL_QS_HISTOGRAM = "quality_speed_histogram"
 
-EP_QS_SUMMARY       = "/quality/speed/summary"
-EP_QS_HISTOGRAM     = "/quality/speed/histogram"
-EP_QS_TOP_LOCATIONS = "/quality/speed/top/locations"
+EP_QS_SUMMARY   = "/quality/speed/summary"
+EP_QS_HISTOGRAM = "/quality/speed/histogram"
 
 def qs_api_get(path, start_dt_utc, end_dt_utc, extra_params=None):
     headers = {
@@ -1413,50 +1411,6 @@ def transform_qs_histogram(result: dict) -> pd.DataFrame:
     print(f"✔️ histogram: {len(df)} filas")
     return df
 
-def transform_qs_top_locations(result: dict) -> pd.DataFrame:
-    if not isinstance(result, dict):
-        return pd.DataFrame()
-    meta = qs_parse_meta(result.get("meta"))
-    if meta["window_start"] is None or meta["window_end"] is None:
-        print("⚠️ top/locations: ventana inválida")
-        return pd.DataFrame()
-    loc_type = meta["location_type"] or "country"
-    items = result.get("top_0") or result.get("top") or []
-    rows = []
-    now_utc = _now_utc()
-    for idx, it in enumerate(items):
-        loc_id = (it.get("id") or it.get("code") or it.get("location_id") or it.get("clientCountryAlpha2"))
-        loc_name = (it.get("name") or it.get("location_name") or it.get("clientCountryName"))
-        val = _coerce_float(it.get("value"))
-        if val is None:
-            val = _coerce_float(it.get("share"))
-        rows.append({
-            "window_start":        meta["window_start"],
-            "window_end":          meta["window_end"],
-            "location_type":       loc_type,
-            "location_id":         str(loc_id) if loc_id is not None else "N/A",
-            "location_name":       loc_name,
-            "rank":                idx + 1,
-            "value":               val,
-            "normalization":       meta["normalization"],
-            "unit":                meta["unit"],
-            "confidence_level":    meta["confidence_level"],
-            "last_updated":        meta["last_updated"],
-            "annotations":         meta["annotations"],
-            "ingestion_timestamp": now_utc
-        })
-    df = pd.DataFrame.from_records(rows)
-    if not df.empty:
-        df.drop_duplicates(
-            subset=["window_start","window_end","location_type","location_id"],
-            keep="last",
-            inplace=True
-        )
-        df.sort_values(["window_start","window_end","rank"], inplace=True)
-        df.reset_index(drop=True, inplace=True)
-    print(f"✔️ top_locations: {len(df)} filas")
-    return df
-
 def qs_bulk_insert(conn, table_name: str, df: pd.DataFrame, expected_cols: list, conflict_cols: list):
     if df.empty:
         print(f"⚠️ No hay datos para cargar en {table_name}.")
@@ -1517,20 +1471,6 @@ def run_qs_histogram(conn, start_dt, end_dt):
     n = qs_bulk_insert(conn, TBL_QS_HISTOGRAM, df, cols, conflict)
     print(f"✅ HISTOGRAM: filas procesadas {n}.")
 
-def run_qs_top_locations(conn, start_dt, end_dt):
-    print("\n--- QUALITY/SPEED TOP/LOCATIONS ---")
-    cols = [
-        "window_start","window_end","location_type","location_id","location_name","rank","value",
-        "normalization","unit","confidence_level","last_updated",
-        "annotations","ingestion_timestamp"
-    ]
-    conflict = ["window_start","window_end","location_type","location_id"]
-    # ✅ Cambio mínimo: pedir más filas (50)
-    result = qs_api_get(EP_QS_TOP_LOCATIONS, start_dt, end_dt, extra_params={"limit": 50})
-    df = transform_qs_top_locations(result)
-    n = qs_bulk_insert(conn, TBL_QS_TOP_LOCATIONS, df, cols, conflict)
-    print(f"✅ TOP/LOCATIONS: filas procesadas {n}.")
-
 def run_quality_speed_all(days=1, which="all"):
     end_date = _now_utc().replace(second=0, microsecond=0)
     start_date = end_date - timedelta(days=days)
@@ -1541,8 +1481,7 @@ def run_quality_speed_all(days=1, which="all"):
             run_qs_summary(conn, start_date, end_date)
         if which in ("all","histogram"):
             run_qs_histogram(conn, start_date, end_date)
-        if which in ("all","top_locations"):
-            run_qs_top_locations(conn, start_date, end_date)
+        # Nota: top_locations eliminado
     finally:
         conn.close()
         print("--- Conexión a DB cerrada (quality/speed) ---")
@@ -1788,7 +1727,7 @@ def run_daily_default():
     # 5) HTTP summary browsers (último día)
     run_http_summary_browsers(days=1)
 
-    # 6) Quality/Speed (summary + histogram + top_locations) para último día
+    # 6) Quality/Speed (summary + histogram) para último día
     run_quality_speed_all(days=1, which="all")
 
 
