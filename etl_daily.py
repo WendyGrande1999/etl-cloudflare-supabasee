@@ -4,15 +4,15 @@
 """
 ETL diario (sin parámetros) para Cloudflare Radar -> Supabase/PostgreSQL.
 
-Incluye los siguientes pipelines ya probados por el usuario (codes 1..6), unificados:
+Incluye los siguientes pipelines ya probados por el usuario (codes 1..8), unificados:
   1) attacks_layer3_timeseries_protocol
   2) radar_http_ip_version (timeseries/summary/top) [rangos internos 30d/90d/7d]
   3) attacks_l3_summary_protocol + attacks_l3_summary_ip_version
   4) netflows_top_locations
   5) http_summary_browsers
-  6) quality_speed_{summary,histogram}  [con limit=50 eliminado para top/locations]
-
-+ 7) attacks_l3_top_origin_locations (NUEVO)  ← integración solicitada
+  6) quality_speed_{summary,histogram}  [sin top_locations]
+  7) attacks_l3_top_origin_locations
+  8) http_version_timeseries (HTTP/1.x vs HTTP/2 vs HTTP/3)
 
 Ejecuta TODO de forma diaria (últimas 24h) sin CLI. Programable en Windows Task Scheduler.
 """
@@ -1701,13 +1701,284 @@ def run_attacks_l3_top_origin(date_range: str = "30d", limit: int = 100):
 
 
 # ====================================================================
+# 8) CODE 8: http_version_timeseries (HTTP/1.x vs HTTP/2 vs HTTP/3)
+# ====================================================================
+
+EP_HTTP_VERSION_TS_GROUPS = "/http/timeseries_groups/HTTP_VERSION"
+TBL_HTTP_VERSION_TS = "http_version_timeseries"
+
+def api_get_http_version_timeseries(start_dt_utc, end_dt_utc, agg_interval="1d", extra_params=None):
+    """
+    Llama a /http/timeseries_groups/HTTP_VERSION con dateStart/dateEnd.
+    Devuelve TODO el payload JSON (incluyendo 'result', 'success', etc.).
+    """
+    headers = {
+        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    params = {
+        "aggInterval": agg_interval,
+        "dateStart": start_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "dateEnd":   end_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "format":    "JSON"
+    }
+    if extra_params:
+        params.update(extra_params)
+
+    url = f"{API_BASE_RADAR}{EP_HTTP_VERSION_TS_GROUPS}"
+    print(f"-> GET {url}")
+    print(f"   Rango: {params['dateStart']}  a  {params['dateEnd']}  | aggInterval={params['aggInterval']}")
+
+    if not CLOUDFLARE_API_TOKEN or CLOUDFLARE_API_TOKEN.strip() == "":
+        raise ValueError("El token de Cloudflare API está vacío.")
+
+    resp = requests.get(url, headers=headers, params=params, timeout=60)
+    if not resp.ok:
+        print(f"❌ HTTP {resp.status_code}: {resp.text[:400]}")
+        resp.raise_for_status()
+
+    data = resp.json()
+    if not data.get("success", False):
+        raise ValueError(f"Respuesta sin success=true. Errores: {data.get('errors')}")
+    return data  # devolvemos el raíz con 'result'
+
+def parse_meta_http(meta: dict):
+    """
+    Extrae metadatos de result['meta'].
+    """
+    meta = meta or {}
+
+    agg_interval = meta.get("aggInterval")
+
+    # dateRange en Radar puede venir como lista con objetos {startTime, endTime}
+    date_range = meta.get("dateRange", {})
+    if isinstance(date_range, list) and date_range:
+        dr0 = date_range[0]
+        start_time = dr0.get("startTime")
+        end_time   = dr0.get("endTime")
+    else:
+        start_time = date_range.get("startTime")
+        end_time   = date_range.get("endTime")
+
+    window_start = _to_dt_utc(start_time)
+    window_end   = _to_dt_utc(end_time)
+
+    normalization = meta.get("normalization")
+
+    # units es lista tipo [{"name":"*","value":"requests"}]
+    unit = None
+    units = meta.get("units", []) or []
+    if isinstance(units, list) and units:
+        unit = units[0].get("value") or units[0].get("name")
+
+    conf_info = meta.get("confidenceInfo", {}) or {}
+    confidence_level = conf_info.get("level")
+    annotations = conf_info.get("annotations")
+
+    last_updated = _to_dt_utc(meta.get("lastUpdated"))
+
+    return {
+        "agg_interval": agg_interval,
+        "window_start": window_start,
+        "window_end": window_end,
+        "normalization": normalization,
+        "unit": unit,
+        "confidence_level": confidence_level,
+        "annotations": annotations,
+        "last_updated": last_updated,
+    }
+
+def transform_http_version_timeseries(payload: dict) -> pd.DataFrame:
+    """
+    Adapta el payload oficial:
+    {
+      "result": {
+        "meta": {...},
+        "serie_0": {
+           "timestamps": [...],
+           "HTTP/1.x": [...],
+           "HTTP/2":   [...],
+           "HTTP/3":   [...]
+        }
+      },
+      "success": true
+    }
+    """
+    if not isinstance(payload, dict):
+        return pd.DataFrame()
+
+    result_block = payload.get("result") or {}
+    if not isinstance(result_block, dict):
+        print("⚠️ Payload sin 'result' dict")
+        return pd.DataFrame()
+
+    # meta
+    meta_info = parse_meta_http(result_block.get("meta"))
+
+    # localizar 'serie_*' dentro de result_block
+    serie_key = None
+    for k in result_block.keys():
+        if k.startswith("serie_"):
+            serie_key = k
+            break
+
+    if serie_key is None:
+        print("⚠️ result.* no trae serie_*")
+        return pd.DataFrame()
+
+    serie_block = result_block.get(serie_key, {})
+    if not isinstance(serie_block, dict):
+        print("⚠️ serie_* no es dict")
+        return pd.DataFrame()
+
+    # timestamps
+    timestamps = serie_block.get("timestamps", [])
+    if not isinstance(timestamps, list) or not timestamps:
+        print("⚠️ No hay timestamps en la serie")
+        return pd.DataFrame()
+
+    # detectar llaves versión HTTP (todo menos 'timestamps')
+    version_keys = [vk for vk in serie_block.keys() if vk != "timestamps"]
+
+    now_utc = _now_utc()
+    rows = []
+
+    for idx, ts in enumerate(timestamps):
+        ts_utc = _to_dt_utc(ts)
+
+        # para cada versión disponible ("HTTP/2", "HTTP/3", etc.)
+        for vk in version_keys:
+            values_list = serie_block.get(vk, [])
+            val_raw = values_list[idx] if idx < len(values_list) else None
+            val = _coerce_float(val_raw)
+
+            if ts_utc is None or vk is None:
+                continue
+
+            rows.append({
+                "timestamp_utc":        ts_utc,
+                "agg_interval":         meta_info["agg_interval"],
+                "http_version":         vk,   # "HTTP/1.x", "HTTP/2", "HTTP/3"
+                "value_share":          val,
+
+                "window_start":         meta_info["window_start"],
+                "window_end":           meta_info["window_end"],
+                "normalization":        meta_info["normalization"],
+                "unit":                 meta_info["unit"],
+                "confidence_level":     meta_info["confidence_level"],
+                "last_updated":         meta_info["last_updated"],
+                "annotations":          json.dumps(meta_info["annotations"]) if meta_info["annotations"] is not None else None,
+
+                "ingestion_timestamp":  now_utc
+            })
+
+    df = pd.DataFrame.from_records(rows)
+
+    if not df.empty:
+        # PK en la tabla es (timestamp_utc, agg_interval, http_version)
+        df.drop_duplicates(
+            subset=["timestamp_utc", "agg_interval", "http_version"],
+            keep="last",
+            inplace=True
+        )
+        df.sort_values(["timestamp_utc", "http_version"], inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+    print(f"✔️ HTTP_VERSION timeseries: {len(df)} filas (transformadas)")
+    return df
+
+def bulk_upsert(conn, table_name: str, df: pd.DataFrame, cols: list, conflict_cols: list) -> int:
+    if df.empty:
+        print(f"⚠️ No hay datos para cargar en {table_name}.")
+        return 0
+
+    # validación columnas
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"{table_name}: faltan columnas en DataFrame: {missing}")
+
+    df = df[cols]
+
+    cur = conn.cursor()
+    tuples = [tuple(x) for x in df.to_numpy()]
+    placeholders = "(" + ",".join(["%s"] * len(cols)) + ")"
+    values_sql = ",".join(cur.mogrify(placeholders, row).decode("utf-8") for row in tuples)
+
+    conflict = ", ".join(conflict_cols)
+    update_cols = [c for c in cols if c not in conflict_cols + ["ingestion_timestamp"]]
+    update_set_parts = [f"{c} = EXCLUDED.{c}" for c in update_cols]
+    update_set_parts.append("ingestion_timestamp = EXCLUDED.ingestion_timestamp")
+    update_set = ", ".join(update_set_parts)
+
+    sql = f"""
+        INSERT INTO {table_name} ({",".join(cols)})
+        VALUES {values_sql}
+        ON CONFLICT ({conflict})
+        DO UPDATE SET
+            {update_set};
+    """
+    cur.execute(sql)
+    conn.commit()
+    cur.close()
+    return len(df)
+
+def run_http_version_timeseries(conn, start_dt, end_dt, agg_interval="1d"):
+    print("\n--- HTTP VERSION TIMESERIES (HTTP/1.x vs HTTP/2 vs HTTP/3) ---")
+
+    cols = [
+        "timestamp_utc",
+        "agg_interval",
+        "http_version",
+        "value_share",
+        "window_start",
+        "window_end",
+        "normalization",
+        "unit",
+        "confidence_level",
+        "last_updated",
+        "annotations",
+        "ingestion_timestamp"
+    ]
+    conflict = ["timestamp_utc", "agg_interval", "http_version"]
+
+    payload = api_get_http_version_timeseries(start_dt, end_dt, agg_interval=agg_interval)
+    df = transform_http_version_timeseries(payload)
+
+    if df.empty:
+        try:
+            print("ℹ️ Payload (vista corta):", json.dumps(payload, default=str)[:900], "...")
+        except Exception:
+            pass
+
+    n = bulk_upsert(conn, TBL_HTTP_VERSION_TS, df, cols, conflict)
+    print(f"✅ Cargadas {n} filas en {TBL_HTTP_VERSION_TS}")
+
+def run_http_version_all(days=30, agg_interval="1d"):
+    end_date = _now_utc().replace(second=0, microsecond=0)
+    start_date = end_date - timedelta(days=days)
+    print(f"=== HTTP VERSION Ingesta: últimos {days} días ===")
+
+    conn = _pg_conn()
+    try:
+        run_http_version_timeseries(conn, start_date, end_date, agg_interval=agg_interval)
+    finally:
+        conn.close()
+        print("--- Conexión a DB cerrada (http_version_timeseries) ---")
+
+    print("=== HTTP VERSION Finalizado ===")
+
+
+# ====================================================================
 # ORQUESTADOR DIARIO (sin CLI)
 # ====================================================================
 
 def run_daily_default():
     """
-    Ejecuta todo el pipeline con ventana rolling de 1 día.
+    Ejecuta todo el pipeline con ventana rolling de 1 día (o rangos internos según cada módulo).
     - Mantiene rangos internos de http_ipv_all (30d/90d/7d) tal como fue probado.
+    - quality/speed: último día.
+    - http_version_timeseries: últimos 30 días.
     """
     # 1) Attacks L3 timeseries (último día)
     run_attacks_ts_protocol(days=1)
@@ -1729,6 +2000,9 @@ def run_daily_default():
 
     # 6) Quality/Speed (summary + histogram) para último día
     run_quality_speed_all(days=1, which="all")
+
+    # 7) HTTP Version Timeseries (últimos 30 días, agg_interval=1d)
+    run_http_version_all(days=30, agg_interval="1d")
 
 
 if __name__ == "__main__":
