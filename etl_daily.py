@@ -4,13 +4,11 @@
 """
 ETL diario (sin parámetros) para Cloudflare Radar -> Supabase/PostgreSQL.
 
-Incluye los siguientes pipelines ya probados por el usuario (codes 1..8), unificados:
-  1) attacks_layer3_timeseries_protocol
+Incluye los siguientes pipelines ya probados por el usuario (codes 2..5,7,8), unificados:
   2) radar_http_ip_version (timeseries/summary/top) [rangos internos 30d/90d/7d]
   3) attacks_l3_summary_protocol + attacks_l3_summary_ip_version
   4) netflows_top_locations
   5) http_summary_browsers
-  6) quality_speed_{summary,histogram}  [sin top_locations]
   7) attacks_l3_top_origin_locations
   8) http_version_timeseries (HTTP/1.x vs HTTP/2 vs HTTP/3)
 
@@ -77,165 +75,6 @@ def _coerce_float(x):
 
 def _pg_conn():
     return psycopg2.connect(PG_CONN_URL)
-
-# ====================================================================
-# 1) CODE 1: attacks_layer3_timeseries_protocol (sin cambios relevantes)
-# ====================================================================
-
-PROTOCOLS = ["TCP", "UDP", "ICMP", "GRE"]
-TABLE_ATTACKS_TS = "attacks_layer3_timeseries_protocol"
-ENDPOINT_ATTACKS_TS = "/attacks/layer3/timeseries_groups/protocol"  # Radar v4
-
-def fetch_cloudflare_timeseries(start_dt_utc, end_dt_utc, agg_interval=None):
-    headers = {
-        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-        "Accept": "application/json",
-    }
-    params = {
-        "dateStart": start_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "dateEnd":   end_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    if agg_interval:
-        params["aggInterval"] = agg_interval
-
-    url = f"{API_BASE_RADAR}{ENDPOINT_ATTACKS_TS}"
-    print(f"-> Consultando {url}")
-    print(f"   Rango: {params['dateStart']}  a  {params['dateEnd']}")
-
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=60)
-        if not resp.ok:
-            print(f"❌ HTTP {resp.status_code}: {resp.text[:400]}")
-            resp.raise_for_status()
-        data = resp.json()
-        if "result" not in data:
-            raise ValueError("Respuesta sin 'result'")
-        return data["result"]
-    except Exception as e:
-        print(f"❌ Error al conectar con Cloudflare Radar: {e}")
-        return None
-
-def transform_timeseries_result(result_json: dict) -> pd.DataFrame:
-    if result_json is None:
-        return pd.DataFrame()
-
-    series_block = None
-    if isinstance(result_json, dict):
-        if "series" in result_json and isinstance(result_json["series"], dict):
-            series_block = result_json["series"]
-        elif "serie_0" in result_json and isinstance(result_json["serie_0"], dict):
-            series_block = result_json["serie_0"]
-        else:
-            if "series" in result_json and isinstance(result_json["series"], list) and result_json["series"]:
-                series_block = result_json["series"][0]
-
-    if series_block is None:
-        print("⚠️ No se encontró 'series' ni 'serie_0' en la respuesta.")
-        return pd.DataFrame()
-
-    meta = result_json.get("meta", {})
-    unit = None
-    confidence_level = None
-
-    try:
-        units = meta.get("units", [])
-        if units and isinstance(units, list) and isinstance(units[0], dict):
-            unit = units[0].get("value")
-    except Exception:
-        pass
-
-    try:
-        confidence_level = meta.get("confidenceInfo", {}).get("level")
-    except Exception:
-        pass
-
-    timestamps = series_block.get("timestamps", []) or series_block.get("timeStamps", [])
-    if not timestamps:
-        print("⚠️ La serie no contiene 'timestamps'.")
-        return pd.DataFrame()
-
-    records = []
-    now_utc = _now_utc()
-
-    for idx, ts in enumerate(timestamps):
-        ts_dt = pd.to_datetime(ts, utc=True, errors="coerce")
-        if pd.isna(ts_dt):
-            continue
-
-        for proto in PROTOCOLS:
-            values = series_block.get(proto, [])
-            val = 0.0
-            if isinstance(values, list) and idx < len(values) and values[idx] is not None:
-                try:
-                    val = float(values[idx])
-                except Exception:
-                    val = 0.0
-
-            records.append({
-                "data_end_time": ts_dt,
-                "attack_protocol": proto,
-                "total_requests": val,
-                "unit": unit,
-                "confidence_level": confidence_level,
-                "ingestion_timestamp": now_utc
-            })
-
-    df = pd.DataFrame.from_records(records)
-    if not df.empty:
-        df.drop_duplicates(subset=["data_end_time", "attack_protocol"], keep="last", inplace=True)
-        df.sort_values(["data_end_time", "attack_protocol"], inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-    print(f"✔️ Transformación OK: {len(df)} filas")
-    return df
-
-def load_attacks_ts(df: pd.DataFrame):
-    if df.empty:
-        print("⚠️ No hay datos para cargar.")
-        return
-
-    conn = None
-    try:
-        conn = _pg_conn()
-        cur = conn.cursor()
-
-        tuples = [tuple(x) for x in df.to_numpy()]
-        cols = ",".join(df.columns)
-        placeholders = "(" + ",".join(["%s"] * len(df.columns)) + ")"
-        values_sql = ",".join(cur.mogrify(placeholders, row).decode("utf-8") for row in tuples)
-
-        insert_sql = f"""
-            INSERT INTO {TABLE_ATTACKS_TS} ({cols})
-            VALUES {values_sql}
-            ON CONFLICT (data_end_time, attack_protocol)
-            DO NOTHING;
-        """
-        cur.execute(insert_sql)
-        conn.commit()
-        print(f"✅ Carga OK: {cur.rowcount} filas nuevas en '{TABLE_ATTACKS_TS}'.")
-    except psycopg2.Error as e:
-        print(f"❌ Error PostgreSQL/Supabase: {e}")
-    except Exception as e:
-        print(f"❌ Error general al cargar: {e}")
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-def run_attacks_ts_protocol(days=1):
-    end_date = _now_utc().replace(second=0, microsecond=0)
-    start_date = end_date - timedelta(days=days)
-    print(f"--- Iniciando Ingesta attacks_ts_protocol últimos {days} día(s) ---")
-    result = fetch_cloudflare_timeseries(start_date, end_date, agg_interval=None)
-    if result is None:
-        print("--- Proceso finalizado (sin datos) ---")
-        return
-    df = transform_timeseries_result(result)
-    load_attacks_ts(df)
-    print("--- Proceso Finalizado (attacks_ts_protocol) ---")
-
 
 # ====================================================================
 # 2) CODE 2: radar_http_ip_version (sin cambios de lógica)
@@ -1068,7 +907,7 @@ def transform_top_browsers(result_json: dict) -> pd.DataFrame:
         return pd.DataFrame()
     normalization = meta.get("normalization")
     unit = None
-    units = meta.get("units", [])
+    units = meta.get("units", []) or []
     if isinstance(units, list) and units:
         unit = units[0].get("value") or units[0].get("name")
     conf_info = meta.get("confidenceInfo", {}) or {}
@@ -1174,318 +1013,6 @@ def run_http_summary_browsers(days=1):
     except Exception as e:
         print(f"🛑 Error inesperado: {e}")
     print("--- Proceso Finalizado (http_summary_browsers) ---")
-
-
-# ====================================================================
-# 6) CODE 6: quality/speed (summary + histogram)  [top_locations removido]
-# ====================================================================
-
-TBL_QS_SUMMARY   = "quality_speed_summary"
-TBL_QS_HISTOGRAM = "quality_speed_histogram"
-
-EP_QS_SUMMARY   = "/quality/speed/summary"
-EP_QS_HISTOGRAM = "/quality/speed/histogram"
-
-def qs_api_get(path, start_dt_utc, end_dt_utc, extra_params=None):
-    headers = {
-        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-        "Accept": "application/json",
-    }
-    params = {
-        "dateStart": start_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "dateEnd":   end_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    if extra_params:
-        params.update(extra_params)
-    url = f"{API_BASE_RADAR}{path}"
-    print(f"-> GET {url}")
-    print(f"   Rango: {params['dateStart']}  a  {params['dateEnd']}")
-    if not CLOUDFLARE_API_TOKEN or CLOUDFLARE_API_TOKEN.strip() == "":
-        raise ValueError("El token de Cloudflare API está vacío.")
-    resp = requests.get(url, headers=headers, params=params, timeout=60)
-    if not resp.ok:
-        print(f"❌ HTTP {resp.status_code}: {resp.text[:400]}")
-        resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success", False):
-        raise ValueError(f"Respuesta sin success=true en {path}. Errores: {data.get('errors')}")
-    return data.get("result")
-
-def qs_parse_meta(meta: dict):
-    meta = meta or {}
-    date_range = meta.get("dateRange", []) or []
-    win = date_range[0] if date_range else {}
-    window_start = _to_dt_utc(win.get("startTime"))
-    window_end   = _to_dt_utc(win.get("endTime"))
-    normalization = meta.get("normalization")
-    unit = None
-    units = meta.get("units", []) or []
-    if isinstance(units, list) and units:
-        unit = units[0].get("value") or units[0].get("name")
-    conf_info = meta.get("confidenceInfo", {}) or {}
-    confidence_level = conf_info.get("level")
-    annotations = conf_info.get("annotations")
-    last_updated = _to_dt_utc(meta.get("lastUpdated"))
-    location_type = meta.get("locationType")
-    bucket_size = meta.get("bucketSize")
-    return {
-        "window_start": window_start,
-        "window_end": window_end,
-        "normalization": normalization,
-        "unit": unit,
-        "confidence_level": confidence_level,
-        "annotations": annotations,
-        "last_updated": last_updated,
-        "location_type": location_type,
-        "bucket_size": bucket_size,
-    }
-
-def qs_explode_metric_pair(name, value):
-    out = []
-    if isinstance(value, dict):
-        for k, v in value.items():
-            out.append((f"{name}.{k}", _coerce_float(v)))
-    else:
-        out.append((str(name), _coerce_float(value)))
-    return out
-
-def qs_iter_summaries(result: dict):
-    pairs = []
-    if not isinstance(result, dict):
-        return pairs
-    candidate_objs = []
-    for k, v in result.items():
-        if "summary" in str(k):
-            candidate_objs.append(v)
-    if not candidate_objs:
-        v = result.get("summary") or result.get("summary_0")
-        if v is not None:
-            candidate_objs.append(v)
-    for obj in candidate_objs:
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                pairs.extend(qs_explode_metric_pair(k, v))
-        elif isinstance(obj, list):
-            for elem in obj:
-                if isinstance(elem, dict):
-                    name = elem.get("name") or elem.get("metric") or elem.get("key")
-                    if name is None:
-                        for k, v in elem.items():
-                            if k not in ("name","metric","key","value"):
-                                pairs.extend(qs_explode_metric_pair(k, v))
-                        continue
-                    value = elem.get("value")
-                    pairs.extend(qs_explode_metric_pair(name, value))
-                elif isinstance(elem, (list, tuple)) and len(elem) >= 2:
-                    name, value = elem[0], elem[1]
-                    pairs.extend(qs_explode_metric_pair(name, value))
-                else:
-                    continue
-    return [(n, v) for (n, v) in pairs if n is not None]
-
-def transform_qs_summary(result: dict) -> pd.DataFrame:
-    if not isinstance(result, dict):
-        return pd.DataFrame()
-    meta = qs_parse_meta(result.get("meta"))
-    if meta["window_start"] is None or meta["window_end"] is None:
-        print("⚠️ summary: ventana inválida")
-        return pd.DataFrame()
-    pairs = qs_iter_summaries(result)
-    if not pairs:
-        print("⚠️ summary: no se detectaron métricas en el payload")
-        try:
-            print("ℹ️ Claves en result:", list(result.keys()))
-            print("ℹ️ meta:", json.dumps(result.get("meta", {}), default=str)[:400], "...")
-        except Exception:
-            pass
-        return pd.DataFrame()
-    now_utc = _now_utc()
-    rows = []
-    for metric_name, val in pairs:
-        rows.append({
-            "window_start":        meta["window_start"],
-            "window_end":          meta["window_end"],
-            "metric_name":         str(metric_name),
-            "value":               _coerce_float(val),
-            "normalization":       meta["normalization"],
-            "unit":                meta["unit"],
-            "confidence_level":    meta["confidence_level"],
-            "last_updated":        meta["last_updated"],
-            "annotations":         meta["annotations"],
-            "ingestion_timestamp": now_utc
-        })
-    df = pd.DataFrame.from_records(rows)
-    if not df.empty:
-        df.drop_duplicates(subset=["window_start","window_end","metric_name"], keep="last", inplace=True)
-        df.sort_values(["window_start","window_end","metric_name"], inplace=True)
-        df.reset_index(drop=True, inplace=True)
-    print(f"✔️ summary: {len(df)} filas")
-    return df
-
-def qs_iter_histogram_by_index(result: dict):
-    if not isinstance(result, dict):
-        return []
-    h = result.get("histogram_0") or result.get("histogram") or {}
-    if not isinstance(h, dict):
-        return []
-    out = []
-    bucket_min = None
-    try:
-        bm = h.get("bucketMin")
-        if isinstance(bm, list) and bm:
-            bucket_min = float(bm[0])
-        elif isinstance(bm, (int, float, str)):
-            bucket_min = float(bm)
-    except Exception:
-        bucket_min = None
-    for metric_name, series in h.items():
-        if metric_name == "bucketMin":
-            continue
-        if isinstance(series, list):
-            for idx, raw in enumerate(series):
-                val = _coerce_float(raw)
-                out.append((str(metric_name), idx, val, bucket_min))
-    return out
-
-def transform_qs_histogram(result: dict) -> pd.DataFrame:
-    if not isinstance(result, dict):
-        return pd.DataFrame()
-    meta = qs_parse_meta(result.get("meta"))
-    if meta["window_start"] is None or meta["window_end"] is None:
-        print("⚠️ histogram: ventana inválida")
-        return pd.DataFrame()
-    bucket_size = None
-    try:
-        bs = (result.get("meta") or {}).get("bucketSize")
-        if bs is not None:
-            bucket_size = float(bs)
-    except Exception:
-        bucket_size = None
-    entries = qs_iter_histogram_by_index(result)
-    if not entries:
-        print("⚠️ histogram: no se detectaron bins en el payload (por índice)")
-        try:
-            print("ℹ️ Claves en result:", list(result.keys()))
-            print("ℹ️ meta:", json.dumps(result.get("meta", {}), default=str)[:400], "...")
-        except Exception:
-            pass
-        return pd.DataFrame()
-    now_utc = _now_utc()
-    rows = []
-    for metric_name, idx, val, bucket_min in entries:
-        bin_start = None
-        bin_end = None
-        if bucket_min is not None and bucket_size is not None and bucket_size > 0:
-            bin_start = bucket_min + idx * bucket_size
-            bin_end   = bin_start + bucket_size
-        share, count = None, None
-        if (meta["normalization"] or "").upper() in ("PERCENTAGE", "RATIO", "SHARE"):
-            share = val
-        else:
-            count = val
-        rows.append({
-            "window_start":        meta["window_start"],
-            "window_end":          meta["window_end"],
-            "metric_name":         metric_name,
-            "bin_index":           idx,
-            "bin_start":           bin_start,
-            "bin_end":             bin_end,
-            "share":               share,
-            "count":               count,
-            "normalization":       meta["normalization"],
-            "unit":                meta["unit"],
-            "confidence_level":    meta["confidence_level"],
-            "last_updated":        meta["last_updated"],
-            "annotations":         meta["annotations"],
-            "ingestion_timestamp": now_utc
-        })
-    df = pd.DataFrame.from_records(rows)
-    if not df.empty:
-        df.drop_duplicates(
-            subset=["window_start","window_end","metric_name","bin_index","normalization","unit"],
-            keep="last",
-            inplace=True
-        )
-        df.sort_values(["window_start","window_end","metric_name","bin_index"], inplace=True)
-        df.reset_index(drop=True, inplace=True)
-    print(f"✔️ histogram: {len(df)} filas")
-    return df
-
-def qs_bulk_insert(conn, table_name: str, df: pd.DataFrame, expected_cols: list, conflict_cols: list):
-    if df.empty:
-        print(f"⚠️ No hay datos para cargar en {table_name}.")
-        return 0
-    missing = [c for c in expected_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"{table_name}: Faltan columnas en DataFrame: {missing}")
-    df = df[expected_cols]
-    cur = conn.cursor()
-    tuples = [tuple(x) for x in df.to_numpy()]
-    placeholders = "(" + ",".join(["%s"] * len(expected_cols)) + ")"
-    values_sql = ",".join(cur.mogrify(placeholders, row).decode("utf-8") for row in tuples)
-    conflict = ", ".join(conflict_cols)
-    update_cols = [c for c in expected_cols if c not in conflict_cols + ["ingestion_timestamp"]]
-    update_set_parts = [f"{col} = EXCLUDED.{col}" for col in update_cols]
-    update_set_parts.append("ingestion_timestamp = EXCLUDED.ingestion_timestamp")
-    update_set = ", ".join(update_set_parts)
-    insert_sql = f"""
-        INSERT INTO {table_name} ({",".join(expected_cols)})
-        VALUES {values_sql}
-        ON CONFLICT ({conflict})
-        DO UPDATE SET
-            {update_set};
-    """
-    cur.execute(insert_sql)
-    conn.commit()
-    cur.close()
-    return len(df)
-
-def run_qs_summary(conn, start_dt, end_dt):
-    print("\n--- QUALITY/SPEED SUMMARY ---")
-    cols = [
-        "window_start","window_end","metric_name","value",
-        "normalization","unit","confidence_level","last_updated",
-        "annotations","ingestion_timestamp"
-    ]
-    conflict = ["window_start","window_end","metric_name"]
-    result = qs_api_get(EP_QS_SUMMARY, start_dt, end_dt)
-    df = transform_qs_summary(result)
-    if df.empty:
-        try:
-            print("ℹ️ Payload (vista corta):", json.dumps(result, default=str)[:800], "...")
-        except Exception:
-            pass
-    n = qs_bulk_insert(conn, TBL_QS_SUMMARY, df, cols, conflict)
-    print(f"✅ SUMMARY: filas procesadas {n}.")
-
-def run_qs_histogram(conn, start_dt, end_dt):
-    print("\n--- QUALITY/SPEED HISTOGRAM ---")
-    cols = [
-        "window_start","window_end","metric_name","bin_index","bin_start","bin_end",
-        "share","count","normalization","unit","confidence_level","last_updated",
-        "annotations","ingestion_timestamp"
-    ]
-    conflict = ["window_start","window_end","metric_name","bin_index","normalization","unit"]
-    result = qs_api_get(EP_QS_HISTOGRAM, start_dt, end_dt)
-    df = transform_qs_histogram(result)
-    n = qs_bulk_insert(conn, TBL_QS_HISTOGRAM, df, cols, conflict)
-    print(f"✅ HISTOGRAM: filas procesadas {n}.")
-
-def run_quality_speed_all(days=1, which="all"):
-    end_date = _now_utc().replace(second=0, microsecond=0)
-    start_date = end_date - timedelta(days=days)
-    print(f"=== QUALITY/SPEED Ingesta: últimos {days} días ===")
-    conn = _pg_conn()
-    try:
-        if which in ("all","summary"):
-            run_qs_summary(conn, start_date, end_date)
-        if which in ("all","histogram"):
-            run_qs_histogram(conn, start_date, end_date)
-        # Nota: top_locations eliminado
-    finally:
-        conn.close()
-        print("--- Conexión a DB cerrada (quality/speed) ---")
-    print("=== QUALITY/SPEED Finalizado ===")
 
 
 # ====================================================================
@@ -1977,29 +1504,22 @@ def run_daily_default():
     """
     Ejecuta todo el pipeline con ventana rolling de 1 día (o rangos internos según cada módulo).
     - Mantiene rangos internos de http_ipv_all (30d/90d/7d) tal como fue probado.
-    - quality/speed: último día.
     - http_version_timeseries: últimos 30 días.
     """
-    # 1) Attacks L3 timeseries (último día)
-    run_attacks_ts_protocol(days=1)
-
     # 2) HTTP ip_version unificado (rangos internos ya probados)
     run_http_ipv_all()
 
     # 3) L3 summaries (último día)
     run_attacks_l3_summaries(date_range="1d")
 
-    # 3B) NUEVO: Top países ORIGEN de ataques L3 (foto 30d, top 100)
-    run_attacks_l3_top_origin(date_range="30d", limit=100)
+    # 3B) Top países ORIGEN de ataques L3 (foto 30d, top 100)
+    run_attacks_l3_top_origin(date_range="30d", limit=100)  # Nota: argumento correcto es date_range
 
     # 4) Netflows Top Locations (último día, product ALL, top 100)
     run_netflows_top_locations(date_range="1d", product="ALL", location_type="country", limit=100)
 
     # 5) HTTP summary browsers (último día)
     run_http_summary_browsers(days=1)
-
-    # 6) Quality/Speed (summary + histogram) para último día
-    run_quality_speed_all(days=1, which="all")
 
     # 7) HTTP Version Timeseries (últimos 30 días, agg_interval=1d)
     run_http_version_all(days=30, agg_interval="1d")
