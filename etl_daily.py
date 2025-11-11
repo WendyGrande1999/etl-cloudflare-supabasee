@@ -1639,7 +1639,7 @@ def run_daily_default():
     run_attacks_l3_top_origin(date_range="30d", limit=100)  # Nota: argumento correcto es date_range
 
     # 4) Netflows Top Locations (último día, product ALL, top 100)
-    run_netflows_top_locations(date_range="1d", product="ALL", location_type="country", limit=100)
+    run_netflows_top_locations(date_range="30d", product="ALL", location_type="country", limit=100)
 
     # 5) HTTP summary browsers (último día)
     run_http_summary_browsers(days=1)
