@@ -11,6 +11,7 @@ Incluye los siguientes pipelines ya probados por el usuario (codes 2..5,7,8), un
   5) http_summary_browsers
   7) attacks_l3_top_origin_locations
   8) http_version_timeseries (HTTP/1.x vs HTTP/2 vs HTTP/3)
+  9) iqi_latency_summary (p25/p50/p75)
 
 Ejecuta TODO de forma diaria (últimas 24h) sin CLI. Programable en Windows Task Scheduler.
 """
@@ -1497,6 +1498,127 @@ def run_http_version_all(days=30, agg_interval="1d"):
 
 
 # ====================================================================
+# 9) CODE 9: iqi_latency_summary (integrado)
+# ====================================================================
+
+TBL_IQI_LAT_SUMMARY = "iqi_latency_summary"
+EP_IQI_LAT_SUMMARY = "/quality/iqi/summary"
+
+def fetch_iqi_latency_summary(start_dt_utc, end_dt_utc):
+    """
+    Llama a /radar/quality/iqi/summary con metric=LATENCY y rango explícito.
+    Devuelve el payload raíz (success, result, meta, summary_0, etc.).
+    """
+    headers = {
+        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+        "Accept": "application/json",
+    }
+    params = {
+        "metric": "LATENCY",
+        "dateStart": start_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "dateEnd":   end_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "format":    "JSON"
+    }
+    url = f"{API_BASE_RADAR}{EP_IQI_LAT_SUMMARY}"
+    print(f"-> GET {url}")
+    print(f"   Rango: {params['dateStart']}  a  {params['dateEnd']}")
+    resp = requests.get(url, headers=headers, params=params, timeout=60)
+    if not resp.ok:
+        print(f"❌ HTTP {resp.status_code}: {resp.text[:400]}")
+        resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success", False):
+        raise ValueError(f"Respuesta sin success=true: {data.get('errors')}")
+    return data
+
+def transform_iqi_summary(payload: dict) -> dict:
+    """
+    Extrae p25, p50, p75 y metadatos de fechas a una sola fila (dict).
+    """
+    if not isinstance(payload, dict):
+        return {}
+    result = payload.get("result", {}) or {}
+    meta = result.get("meta", {}) or {}
+    summary = result.get("summary_0", {}) or {}
+
+    date_range = meta.get("dateRange", []) or []
+    start_time = end_time = None
+    if isinstance(date_range, list) and date_range:
+        win = date_range[0] or {}
+        start_time = win.get("startTime")
+        end_time   = win.get("endTime")
+    else:
+        start_time = meta.get("startTime")
+        end_time   = meta.get("endTime")
+
+    ds = _to_dt_utc(start_time)
+    de = _to_dt_utc(end_time)
+
+    def _fget(k):
+        try:
+            v = summary.get(k)
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    row = {
+        "date_start": ds,
+        "date_end":   de,
+        "p25_ms":     _fget("p25"),
+        "p50_ms":     _fget("p50"),
+        "p75_ms":     _fget("p75"),
+        "ingestion_timestamp": _now_utc()
+    }
+    return row
+
+def upsert_iqi_summary(conn, table_name: str, row: dict):
+    """
+    UPSERT por (date_start, date_end). Actualiza métricas y timestamp de ingesta.
+    """
+    if not row or not row.get("date_start") or not row.get("date_end"):
+        print("⚠️ Fila IQI vacía o sin fechas; se omite carga.")
+        return
+    cols = list(row.keys())
+    placeholders = ",".join(["%s"] * len(cols))
+    updates = ", ".join([f"{c}=EXCLUDED.{c}" for c in cols if c not in ("date_start","date_end")])
+
+    sql = f"""
+        INSERT INTO {table_name} ({",".join(cols)})
+        VALUES ({placeholders})
+        ON CONFLICT (date_start, date_end)
+        DO UPDATE SET {updates};
+    """
+    cur = conn.cursor()
+    values = []
+    for c in cols:
+        v = row[c]
+        if isinstance(v, pd.Timestamp):
+            v = v.to_pydatetime()
+        values.append(v)
+    cur.execute(sql, values)
+    conn.commit()
+    cur.close()
+    print(f"✅ IQI cargado: {row['date_start']} → {row['date_end']}")
+
+def run_iqi_latency_summary(days=30):
+    """
+    Descarga IQI LATENCY summary para una ventana rolling de 'days' días y upsertea una fila.
+    """
+    end_date = _now_utc().replace(second=0, microsecond=0)
+    start_date = end_date - timedelta(days=days)
+    print(f"=== IQI LATENCY Summary: últimos {days} días ===")
+    payload = fetch_iqi_latency_summary(start_date, end_date)
+    row = transform_iqi_summary(payload)
+    conn = _pg_conn()
+    try:
+        upsert_iqi_summary(conn, TBL_IQI_LAT_SUMMARY, row)
+    finally:
+        conn.close()
+        print("--- Conexión a DB cerrada (iqi_latency_summary) ---")
+    print("=== IQI LATENCY Finalizado ===")
+
+
+# ====================================================================
 # ORQUESTADOR DIARIO (sin CLI)
 # ====================================================================
 
@@ -1505,6 +1627,7 @@ def run_daily_default():
     Ejecuta todo el pipeline con ventana rolling de 1 día (o rangos internos según cada módulo).
     - Mantiene rangos internos de http_ipv_all (30d/90d/7d) tal como fue probado.
     - http_version_timeseries: últimos 30 días.
+    - iqi_latency_summary: últimos 30 días.
     """
     # 2) HTTP ip_version unificado (rangos internos ya probados)
     run_http_ipv_all()
@@ -1523,6 +1646,9 @@ def run_daily_default():
 
     # 7) HTTP Version Timeseries (últimos 30 días, agg_interval=1d)
     run_http_version_all(days=30, agg_interval="1d")
+
+    # 9) IQI Latency Summary (últimos 30 días)
+    run_iqi_latency_summary(days=30)
 
 
 if __name__ == "__main__":
